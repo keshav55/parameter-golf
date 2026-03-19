@@ -636,11 +636,37 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+class _FakeQuantSTE(torch.autograd.Function):
+    """Fake quantization with straight-through estimator for QAT."""
+    @staticmethod
+    def forward(ctx, w: Tensor, bits: int) -> Tensor:
+        qmax = (1 << (bits - 1)) - 1
+        # Per-row scale for 2D, per-tensor for 1D
+        if w.ndim == 2:
+            amax = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
+        else:
+            amax = w.abs().amax().clamp_min(1e-8)
+        scale = amax / qmax
+        return (w / scale).round().clamp(-qmax, qmax) * scale
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> tuple[Tensor, None]:
+        return grad_output, None  # STE: pass gradient through
+
+
+# v5: QAT bits. Set QAT_BITS=8 for INT8 QAT, QAT_BITS=6 for INT6, 0 to disable.
+_QAT_BITS = int(os.environ.get("QAT_BITS", 0))
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # v5: Optional fake quantization during forward pass (QAT) controlled by QAT_BITS env var.
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight
+        if _QAT_BITS > 0 and self.training:
+            w = _FakeQuantSTE.apply(w, _QAT_BITS)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
