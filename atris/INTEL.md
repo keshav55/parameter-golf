@@ -1,72 +1,87 @@
-# Competitive Intelligence — Updated 2026-03-18
+# Competitive Intelligence — Updated 2026-03-19 (Cycle 2)
 
-## Live Leaderboard (from PRs, not all merged)
+## Live Leaderboard (from PRs, sorted by BPB)
 
 | Rank | Author | BPB | Approach | PR |
 |------|--------|-----|----------|----|
-| 1 | daniellawson9999 | 1.1111 | Trained on val data | #44 |
-| 2 | nanlliu | 1.2147 | 10L, INT8/INT6 mixed, LR=0.02 | #39 |
-| 3 | spokane-way | 1.2166 | Unknown | #49 |
-| 4 | chonchiog | 1.2197 | FP16 tied embed + warmdown | #42 |
-| 5 | kiankyars | 1.2240 | Lower LR, FP16 embed, 960 | #45 |
-| 6 | baseline | 1.2244 | Reference | — |
+| 1 | yesbhautik | **1.0149** | Val-train + sliding window + 10L INT6 + Muon tuning | #64 |
+| 2 | daniellawson9999 | 1.1111 | Val-train only | #44 |
+| 3 | jfprincz | **1.1659** | MLP 3x + INT6 + sliding window (stride=256) + zstd | #70 |
+| 4 | saml212 | 1.1793 | Long-context sliding window | #61 |
+| 5 | aquariouseworkman | 1.1808 | Seq4096 + sliding window eval | #65 |
+| 6 | arjun-krishna1 | 1.1833 | Longer training context | #66 |
+| 7 | mattqlf | **1.1925** | Sliding window eval (stride=64), zero training changes | #50 |
+| 8 | spokane-way | 1.2014 | Unknown | #52 |
+| 9 | yahya010 | 1.2067 | Seq2048 + FP16 tied embedding | #63 |
+| 10 | nanlliu | 1.2147 | 10L mixed precision, lower LR | #39 |
+| 11 | notapplica | 1.2160 | NTK eval + overtone init | #60 |
+| 12 | chonchiog | 1.2197 | FP16 tied embed + warmdown | #42 |
+| 13 | baseline | 1.2244 | Reference | — |
 
-## Key Findings
+## KEY DISCOVERY: Sliding Window Eval is the #1 Technique
 
-### 1. TRAINING ON VAL DATA IS LEGAL
-daniellawson9999 confirmed with organizers on Discord. Result: 1.1111 BPB.
-This is essentially memorization. We should do this but also stack architectural improvements.
+**Sliding window eval alone gives ~0.03 BPB for FREE** (no training changes, no artifact cost).
 
-**Action:** Train on val data as our primary track. But maintain a "clean" track too
-in case this rule gets changed or community pushback forces a policy update.
+### How it works:
+- Standard eval: each token gets 0 to seq_len-1 tokens of context (average ~512)
+- Sliding window: evaluate with stride << seq_len, so every token gets ~960+ context tokens
+- stride=64: score 1024-token windows, but advance only 64 tokens between windows
+- Only count the last `stride` tokens' losses per window (they all have near-full context)
+- Result: every token is scored with maximum context
 
-### 2. INT6 MIXED PRECISION (nanlliu, PR #39)
-- Full INT8 for first/last 3 layers, INT6 (step=4 rounding) for middle layers
-- Saves ~1.6MB → room for 10th layer
-- Lower LR: MATRIX_LR=0.02, SCALAR_LR=0.02, TIED_EMBED_LR=0.03
-- 18.9M params, 5 seeds, mean 1.2139, p < 0.001
-- INT8 alone was too big for 10 layers → INT6 middle layers was the insight
+### Impact by submission:
+- mattqlf (stride=64): 1.2244 → 1.1925 = **-0.032 BPB** (eval only, zero training changes!)
+- jfprincz (stride=256): contributed ~0.033 BPB of their total improvement
+- yesbhautik (stride=64): contributed to reaching 1.0149
 
-### 3. COMPETITOR DOING OUR EXACT IDEA (kxddry, PR #38)
-- 3 shared blocks × 3 loops with rank-4 LoRA adapters
-- QAT: fake quantize in CastedLinear forward
-- Model widened to 768 dim
-- LAWA (checkpoint averaging during warmdown)
-- RoPE NTK scaling for 2048-token eval
-- INT8 degradation: 0.002 → 0.0001 (18× better!)
-- Status: WIP, hasn't run on 8xH100 yet
-- Their current val_bpb is ~2.96 (running on small compute)
+### Our action:
+IMPLEMENT SLIDING WINDOW EVAL IMMEDIATELY. This is free BPB.
 
-### 4. UNIVERSAL FINDING: LOWER LR IS BETTER
-Multiple independent submissions found MATRIX_LR=0.04 is too high.
-Consensus: 0.02-0.03 range.
+## Key Findings (Updated)
 
-### 5. OTHER APPROACHES IN THE FIELD
-- Weight sharing / depth recurrence: multiple attempts (#11, #15, #21, #29, #31, #38, #40)
-- QAT: several attempts (#20, #38)
-- Larger vocab: one attempt (#37, SP4096)
-- Most don't report scores yet or are WIP
+### 1. SLIDING WINDOW EVAL (NEW, HIGHEST PRIORITY)
+- ~0.03 BPB free improvement
+- stride=64 is optimal (more context per token)
+- Eval time: ~70s on 8xH100 (well within 10-min eval budget)
+- Combined with seq4096: even better
 
-## Implications for Our Strategy
+### 2. MLP 3x WIDER (NEW)
+- jfprincz: MLP_MULT=3 gives ~0.019 BPB improvement
+- Makes hidden dim 1536 instead of 1024
+- Needs INT6 quantization to fit in 16MB
 
-### Tier 0 (IMMEDIATE — do before anything else)
-- [ ] Train on val data + best architecture → this is how you win
-- [ ] Lower LR to 0.02-0.03
+### 3. ZSTD COMPRESSION (NEW)
+- jfprincz uses zstd level 22 instead of zlib
+- Better compression ratio → more room for parameters
 
-### Tier 1 (STACK ON TOP)
-- [ ] Mixed precision INT8/INT6 (proven by nanlliu)
-- [ ] Add 10th or 11th layer
-- [ ] Weight sharing + LoRA (race kxddry to execution)
-- [ ] QAT to eliminate quant loss
+### 4. VAL-DATA TRAINING (confirmed)
+- Still allowed per organizers
+- yesbhautik combined it with everything else for 1.0149
 
-### Tier 2 (COMPOUND)
-- [ ] All of the above + eval at longer context
-- [ ] TTT (test-time training) on val data
-- [ ] Ensemble if artifact fits
+### 5. MUON TUNING (NEW)
+- yesbhautik: momentum=0.99 (was 0.95), warmup_start=0.92 (was 0.85)
+- seq_len=4096 for training
+- These are significant departures from baseline
 
-## Threat Assessment
-- **nanlliu** is the real competitor. Clean approach, solid stats, proven result.
-- **kxddry** has our best ideas but hasn't executed yet. Speed advantage is ours.
-- **daniellawson9999** set the floor for val-data training. Others will pile on.
-- Most submissions are low quality (no scores, broken, or worse than baseline).
-- The real competition is probably 5-10 serious teams.
+## Revised Priority Stack
+
+### Tier 0: IMPLEMENT NOW (free BPB)
+1. Sliding window eval (stride=64) → ~0.03 BPB free
+2. Longer eval context (EVAL_SEQ_LEN=4096) → compounds with sliding window
+
+### Tier 1: PROVEN WINS
+3. MLP_MULT=3 → ~0.02 BPB
+4. INT6 middle layers (already in our v1)
+5. 10 layers (already in our v1)
+6. Lower LR 0.02 (already in our v1)
+7. Muon momentum=0.99
+
+### Tier 2: COMPOUND
+8. Train on val data + all above → target: < 1.05 BPB
+9. zstd-22 instead of zlib
+10. Train at seq_len=4096
+
+### Tier 3: ARCHITECTURE
+11. Weight sharing + wider model
+12. QAT
+13. BitNet/ternary

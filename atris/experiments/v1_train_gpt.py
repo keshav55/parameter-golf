@@ -71,7 +71,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))  # v2: 3x MLP (was 2x), ~0.02 BPB improvement
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -94,6 +94,11 @@ class Hyperparameters:
 
     # v1: Eval sequence length (can be longer than train for free BPB improvement)
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
+    # v2: Sliding window eval stride. stride < eval_seq_len means overlapping windows.
+    # Each token gets scored with ~(eval_seq_len - stride) context tokens.
+    # stride=64 with seq_len=1024 → every token has 960+ context → ~0.03 BPB free.
+    # Set to 0 to disable (uses standard non-overlapping eval).
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -240,41 +245,106 @@ def eval_val(
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
-    # v1: uses eval_seq_len instead of train_seq_len for potentially longer eval context
+    #
+    # v2: Sliding window eval. When eval_stride < eval_seq_len, we use overlapping
+    # windows so every token is scored with near-maximum context. This gives ~0.03 BPB
+    # improvement for free (no training changes, no artifact cost).
     eval_seq_len = args.eval_seq_len
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < eval_seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, eval_seq_len={eval_seq_len}"
-        )
-    local_batch_seqs = local_batch_tokens // eval_seq_len
-    total_seqs = (val_tokens.numel() - 1) // eval_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
+    stride = args.eval_stride if args.eval_stride > 0 else eval_seq_len
+
+    # Unwrap DDP to access forward_per_token_loss
+    raw_model = model.module if hasattr(model, "module") else model
+    # Handle torch.compile wrapper
+    if hasattr(raw_model, "_orig_mod"):
+        raw_model = raw_model._orig_mod
+
+    use_sliding = stride < eval_seq_len and hasattr(raw_model, "forward_per_token_loss")
+
+    if not use_sliding:
+        # Standard non-overlapping eval (original behavior)
+        local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+        if local_batch_tokens < eval_seq_len:
+            raise ValueError(
+                "VAL_BATCH_SIZE must provide at least one sequence per rank; "
+                f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+                f"GRAD_ACCUM_STEPS={grad_accum_steps}, eval_seq_len={eval_seq_len}"
+            )
+        local_batch_seqs = local_batch_tokens // eval_seq_len
+        total_seqs = (val_tokens.numel() - 1) // eval_seq_len
+        seq_start = (total_seqs * rank) // world_size
+        seq_end = (total_seqs * (rank + 1)) // world_size
+        val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+        val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+        val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+        model.eval()
+        with torch.inference_mode():
+            for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+                batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+                raw_start = batch_seq_start * eval_seq_len
+                raw_end = batch_seq_end * eval_seq_len + 1
+                local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+                x = local[:-1].reshape(-1, eval_seq_len)
+                y = local[1:].reshape(-1, eval_seq_len)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    batch_loss = model(x, y).detach()
+                batch_token_count = float(y.numel())
+                val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+                val_token_count += batch_token_count
+                prev_ids = x.reshape(-1)
+                tgt_ids = y.reshape(-1)
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+        val_loss = val_loss_sum / val_token_count
+        bits_per_token = val_loss.item() / math.log(2.0)
+        tokens_per_byte = val_token_count.item() / val_byte_count.item()
+        model.train()
+        return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+    # --- v2: Sliding window eval ---
+    # Process the validation set with overlapping windows of size eval_seq_len,
+    # advancing by `stride` tokens each step. Only score the last `stride` tokens
+    # per window (they all have near-full context).
+    total_tokens = val_tokens.numel() - 1  # -1 because we need (x, y) pairs
+    # Distribute windows across ranks
+    all_starts = list(range(0, total_tokens - eval_seq_len + 1, stride))
+    rank_starts = all_starts[rank::world_size]
+
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * eval_seq_len
-            raw_end = batch_seq_end * eval_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, eval_seq_len)
-            y = local[1:].reshape(-1, eval_seq_len)
+        for win_start in rank_starts:
+            win_end = win_start + eval_seq_len
+            # x = tokens[win_start:win_end], y = tokens[win_start+1:win_end+1]
+            chunk = val_tokens[win_start : win_end + 1].to(device=device, dtype=torch.int64, non_blocking=True)
+            x = chunk[:-1].unsqueeze(0)  # [1, eval_seq_len]
+            y = chunk[1:].unsqueeze(0)   # [1, eval_seq_len]
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
-            batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                per_token_loss = raw_model.forward_per_token_loss(x, y).detach()
+                # per_token_loss shape: [eval_seq_len]
+
+            # Only count the last `stride` positions (they have full context)
+            score_start = eval_seq_len - stride
+            scored_losses = per_token_loss[score_start:]
+            scored_x = x[0, score_start:]  # prev tokens for byte counting
+            scored_y = y[0, score_start:]  # target tokens
+
+            val_loss_sum += scored_losses.to(torch.float64).sum()
+            val_token_count += float(stride)
+
+            token_bytes = base_bytes_lut[scored_y].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[scored_y] & ~is_boundary_token_lut[scored_x]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
 
     if dist.is_available() and dist.is_initialized():
@@ -778,6 +848,28 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+    def forward_per_token_loss(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        """Return per-token cross-entropy losses (no reduction) for sliding window eval."""
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        targets = target_ids.reshape(-1)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.cross_entropy(logits.float(), targets, reduction="none")
 
 
 # -----------------------------
