@@ -812,6 +812,50 @@ class Block(nn.Module):
         return x
 
 
+# v7: BigramHash — captures local bigram context via hash embedding
+# Used by #1 (thwu1) and #2 (Raahil Shah) on the leaderboard
+_BIGRAM_BUCKETS = int(os.environ.get("BIGRAM_BUCKETS", 0))  # 0=disabled, 4096 or 10240 recommended
+_BIGRAM_DIM = int(os.environ.get("BIGRAM_DIM", 128))
+
+class BigramHash(nn.Module):
+    def __init__(self, num_buckets: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.embed = nn.Embedding(num_buckets, bigram_dim)
+        self.proj = CastedLinear(bigram_dim, model_dim, bias=False)
+        self.proj._zero_init = True
+        # Coprime multipliers for hash function
+        self.register_buffer("mult_a", torch.tensor(2654435761, dtype=torch.long))  # golden ratio hash
+        self.register_buffer("mult_b", torch.tensor(2246822519, dtype=torch.long))
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        # token_ids: [batch, seq_len]
+        # Create shifted version for bigram: pair (prev_token, curr_token)
+        prev = torch.zeros_like(token_ids)
+        prev[:, 1:] = token_ids[:, :-1]
+        # Hash the pair into bucket index
+        h = (prev.long() * self.mult_a + token_ids.long() * self.mult_b) % self.num_buckets
+        bigram_emb = self.embed(h.int())
+        return self.proj(bigram_emb)
+
+
+# v7: SmearGate — learned gate blending current token with previous token
+# Used by #2 and #4 on the leaderboard
+_SMEAR_GATE = bool(int(os.environ.get("SMEAR_GATE", 0)))  # 0=disabled, 1=enabled
+
+class SmearGate(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [batch, seq_len, dim]
+        gate = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        prev = torch.zeros_like(x)
+        prev[:, 1:] = x[:, :-1]
+        return gate * x + (1 - gate) * prev
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -836,6 +880,9 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.num_layers = num_layers
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        # v7: BigramHash and SmearGate
+        self.bigram_hash = BigramHash(_BIGRAM_BUCKETS, _BIGRAM_DIM, model_dim) if _BIGRAM_BUCKETS > 0 else None
+        self.smear_gate = SmearGate(model_dim) if _SMEAR_GATE else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -887,7 +934,11 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.bigram_hash is not None:
+            x = x + self.bigram_hash(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.smear_gate is not None:
+            x = self.smear_gate(x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -918,7 +969,11 @@ class GPT(nn.Module):
     def forward_per_token_loss(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         """Return per-token cross-entropy losses (no reduction) for sliding window eval."""
         x = self.tok_emb(input_ids)
+        if self.bigram_hash is not None:
+            x = x + self.bigram_hash(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.smear_gate is not None:
+            x = self.smear_gate(x)
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
@@ -1087,6 +1142,12 @@ def main() -> None:
     if base_model.layer_scales is not None:
         for ls in base_model.layer_scales:
             scalar_params.append(ls)
+    # v7: BigramHash and SmearGate params
+    if base_model.bigram_hash is not None:
+        scalar_params.append(base_model.bigram_hash.embed.weight)
+        matrix_params.append(base_model.bigram_hash.proj.weight)
+    if base_model.smear_gate is not None:
+        scalar_params.append(base_model.smear_gate.gate)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
