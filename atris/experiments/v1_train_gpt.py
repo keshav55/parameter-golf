@@ -1,14 +1,4 @@
-"""
-Atris v1 fork of train_gpt.py — Parameter Golf competitive submission.
-
-Changes from baseline:
-1. 10 layers (from 9) — validated by nanlliu PR #39
-2. Lower LRs: matrix_lr=0.02, scalar_lr=0.02, tied_embed_lr=0.03
-3. Mixed-precision quantization: INT8 for edge layers, INT6 for middle layers (better zlib compression)
-4. Eval at longer sequence length (EVAL_SEQ_LEN env var, default=train_seq_len)
-
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
-"""
+"""Atris Labs — Parameter Golf submission. Int5 MLP, Int6 attn, BigramHash, SmearGate, SWA, sliding window eval."""
 
 from __future__ import annotations
 
@@ -58,10 +48,10 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))  # v8: 3000 (was 1200)
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))  # v8: 786K (was 524K)
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))  # v8: 2048 (was 1024)
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -71,7 +61,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))  # Keep 2x default (3x doesn't fit with 10 layers)
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))  # v8: 3x (Int5+zstd makes this fit in 16MB)
     # v3: Weight sharing. num_unique_blocks unique blocks repeated to fill num_layers.
     # Set to 0 to disable (each layer gets its own block, original behavior).
     # E.g., num_unique_blocks=4, num_layers=12 → 4 unique blocks × 3 repeats = 12 effective layers.
@@ -98,10 +88,11 @@ class Hyperparameters:
     # v6: Weight decay (decoupled for Muon, standard for Adam)
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
     adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", 0.01))
-    # v6: Stochastic Weight Averaging — collect checkpoints every N steps during warmdown
-    # Set to 0 to disable. Averages all collected checkpoints at end of training.
+    # v6: Stochastic Weight Averaging — collect checkpoints during warmdown.
+    # Starts when LR has decayed below swa_start_frac of peak (i.e., deep in warmdown).
+    # Set swa_every to 0 to disable.
     swa_every = int(os.environ.get("SWA_EVERY", 50))
-    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))  # start at 40% of training
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))  # start when LR < 40% of peak
 
     # v1: Eval sequence length (can be longer than train for free BPB improvement)
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -403,8 +394,20 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
-# v1: Mixed-precision quantization config
-# Layers in [INT6_LAYER_START, INT6_LAYER_END) get INT6 quantization (64 levels)
+# v8: Mixed-precision quantization config (matching winner's strategy)
+# MLP weights → Int5 (32 levels, compresses 1.88x under zstd)
+# Attention weights → Int6 (64 levels, compresses 1.51x under zstd)
+# Embeddings → FP16 passthrough
+# Control tensors → FP32 passthrough
+QUANT_MLP_BITS = int(os.environ.get("QUANT_MLP_BITS", 5))
+QUANT_ATTN_BITS = int(os.environ.get("QUANT_ATTN_BITS", 6))
+QUANT_DEFAULT_BITS = int(os.environ.get("QUANT_DEFAULT_BITS", 6))
+# Magnitude pruning: zero out smallest N% of weights before quantization
+PRUNE_PERCENT = float(os.environ.get("PRUNE_PERCENT", 3.0))
+# Compression: zstd (better ratio) or zlib (fallback)
+USE_ZSTD = bool(int(os.environ.get("USE_ZSTD", 1)))
+ZSTD_LEVEL = int(os.environ.get("ZSTD_LEVEL", 22))
+# Legacy compat
 INT6_LAYER_START = int(os.environ.get("INT6_LAYER_START", 3))
 INT6_LAYER_END = int(os.environ.get("INT6_LAYER_END", 7))
 
@@ -423,6 +426,18 @@ def _extract_layer_index(name: str) -> int | None:
     """Extract transformer block layer index from tensor name, e.g. 'blocks.3.attn.c_q.weight' -> 3."""
     m = re.match(r"blocks\.(\d+)\.", name)
     return int(m.group(1)) if m else None
+
+def _classify_param(name: str) -> str:
+    """Classify parameter for mixed-precision quantization (matching winner's strategy)."""
+    if "tok_emb" in name or "lm_head" in name:
+        return "embed"
+    if ".mlp." in name:
+        return "mlp"
+    if "bigram" in name:
+        return "bigram"
+    if ".attn." in name:
+        return "attn"
+    return "other"
 
 def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     """Quantize a float tensor to int8 storage with configurable bit-width.
@@ -447,29 +462,23 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
         scale = (clip_abs / float(qmax)).clamp_min(1.0 / float(qmax))
-        q = torch.clamp(torch.round(clipped / scale[:, None]), qmin, qmax)
-        if bits == 6:
-            # Round to multiples of 4 for better zlib compression (only 64 unique values in int8 range)
-            q = torch.round(q / 4.0) * 4.0
-        q = q.to(torch.int8).contiguous()
+        q = torch.clamp(torch.round(clipped / scale[:, None]), qmin, qmax).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / float(qmax) if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), qmin, qmax)
-    if bits == 6:
-        q = torch.round(q / 4.0) * 4.0
-    q = q.to(torch.int8).contiguous()
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), qmin, qmax).to(torch.int8).contiguous()
     return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    # v1: Mixed-precision quantization
-    # - per-row int8 for 2D float tensors in edge layers (0-2, 7-9)
-    # - per-row int6 for 2D float tensors in middle layers (3-6)
-    # - per-tensor int8/int6 for other float tensors (same layer logic)
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
+    # v8: Mixed-precision quantization by parameter TYPE (matching winner):
+    # - MLP weights → Int5 (32 levels, best compression under zstd)
+    # - Attention weights → Int6 (64 levels)
+    # - BigramHash weights → Int6
+    # - Embeddings (tok_emb) → FP16 passthrough (preserves quality)
+    # - Control tensors → FP32 passthrough
+    # - Small tensors → FP16 passthrough
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -478,7 +487,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     qmeta: dict[str, dict[str, object]] = {}
     stats = dict.fromkeys(
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors",
-         "baseline_tensor_bytes", "int8_payload_bytes", "int6_tensors"),
+         "baseline_tensor_bytes", "int8_payload_bytes", "int5_tensors", "int6_tensors"),
         0,
     )
 
@@ -494,8 +503,15 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(t)
             continue
 
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
+        # Embeddings → FP16 passthrough (winner keeps tok_emb in FP16)
+        ptype = _classify_param(name)
+        if ptype == "embed":
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
+        # Small float tensors → FP16 passthrough
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
@@ -504,13 +520,18 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
         stats["num_float_tensors"] += 1
 
-        # v1: Determine quantization bits based on layer index
-        layer_idx = _extract_layer_index(name)
-        if layer_idx is not None and INT6_LAYER_START <= layer_idx < INT6_LAYER_END:
-            bits = 6
+        # v8: Determine bits by parameter type
+        if ptype == "mlp":
+            bits = QUANT_MLP_BITS  # default 5
+            stats["int5_tensors"] += 1
+        elif ptype == "attn":
+            bits = QUANT_ATTN_BITS  # default 6
+            stats["int6_tensors"] += 1
+        elif ptype == "bigram":
+            bits = QUANT_ATTN_BITS  # same as attention
             stats["int6_tensors"] += 1
         else:
-            bits = 8
+            bits = QUANT_DEFAULT_BITS  # default 6
 
         q, s = quantize_float_tensor(t, bits=bits)
         meta: dict[str, object] = {}
@@ -814,7 +835,7 @@ class Block(nn.Module):
 
 # v7: BigramHash — captures local bigram context via hash embedding
 # Used by #1 (thwu1) and #2 (Raahil Shah) on the leaderboard
-_BIGRAM_BUCKETS = int(os.environ.get("BIGRAM_BUCKETS", 0))  # 0=disabled, 4096 or 10240 recommended
+_BIGRAM_BUCKETS = int(os.environ.get("BIGRAM_BUCKETS", 10240))  # v8: 10240 (matching winner)
 _BIGRAM_DIM = int(os.environ.get("BIGRAM_DIM", 128))
 
 class BigramHash(nn.Module):
@@ -822,26 +843,28 @@ class BigramHash(nn.Module):
         super().__init__()
         self.num_buckets = num_buckets
         self.embed = nn.Embedding(num_buckets, bigram_dim)
+        nn.init.zeros_(self.embed.weight)  # v8: zero-init (starts as no-op, learns gradually)
         self.proj = CastedLinear(bigram_dim, model_dim, bias=False)
-        self.proj._zero_init = True
-        # Coprime multipliers for hash function
-        self.register_buffer("mult_a", torch.tensor(2654435761, dtype=torch.long))  # golden ratio hash
-        self.register_buffer("mult_b", torch.tensor(2246822519, dtype=torch.long))
+        nn.init.zeros_(self.proj.weight)  # v8: zero-init
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))  # v8: learnable scale
+
+    def bigram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.num_buckets - 1
+        out = torch.empty_like(t)
+        out[..., 0] = mod  # first position → last bucket (no previous token)
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return out.long()
 
     def forward(self, token_ids: Tensor) -> Tensor:
-        # token_ids: [batch, seq_len]
-        # Create shifted version for bigram: pair (prev_token, curr_token)
-        prev = torch.zeros_like(token_ids)
-        prev[:, 1:] = token_ids[:, :-1]
-        # Hash the pair into bucket index
-        h = (prev.long() * self.mult_a + token_ids.long() * self.mult_b) % self.num_buckets
-        bigram_emb = self.embed(h.int())
-        return self.proj(bigram_emb)
+        h = self.embed(self.bigram_hash(token_ids))
+        h = self.proj(h)
+        return h * self.scale
 
 
 # v7: SmearGate — learned gate blending current token with previous token
 # Used by #2 and #4 on the leaderboard
-_SMEAR_GATE = bool(int(os.environ.get("SMEAR_GATE", 0)))  # 0=disabled, 1=enabled
+_SMEAR_GATE = bool(int(os.environ.get("SMEAR_GATE", 1)))  # v8: enabled by default
 
 class SmearGate(nn.Module):
     def __init__(self, dim: int):
@@ -1146,6 +1169,7 @@ def main() -> None:
     if base_model.bigram_hash is not None:
         scalar_params.append(base_model.bigram_hash.embed.weight)
         matrix_params.append(base_model.bigram_hash.proj.weight)
+        scalar_params.append(base_model.bigram_hash.scale)
     if base_model.smear_gate is not None:
         scalar_params.append(base_model.smear_gate.gate)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1257,8 +1281,9 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    # v6: SWA state
-    swa_checkpoints: list[dict[str, Tensor]] = []
+    # v6: SWA state — running sum (memory efficient, like winner's implementation)
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
     swa_active = args.swa_every > 0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -1330,11 +1355,16 @@ def main() -> None:
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
-        # v6: SWA checkpoint collection during warmdown
-        if swa_active and args.swa_every > 0:
-            frac_done = approx_training_time_ms / max_wallclock_ms if max_wallclock_ms else step / args.iterations
-            if frac_done >= args.swa_start_frac and step % args.swa_every == 0:
-                swa_checkpoints.append({k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()})
+        # v6: SWA — collect when LR scale drops below swa_start_frac (warmdown region)
+        if swa_active and step % args.swa_every == 0:
+            if scale < args.swa_start_frac:
+                if swa_state is None:
+                    swa_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+                    swa_count = 1
+                else:
+                    for k, v in base_model.state_dict().items():
+                        swa_state[k] += v.detach().cpu()
+                    swa_count += 1
 
         should_log_train = (
             args.train_log_every > 0
@@ -1366,15 +1396,16 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
-    # v6: Apply SWA — average all collected checkpoints
-    if swa_checkpoints:
-        log0(f"swa:applying {len(swa_checkpoints)} checkpoints")
-        avg_state = {}
-        for key in swa_checkpoints[0]:
-            stacked = torch.stack([ckpt[key].float() for ckpt in swa_checkpoints])
-            avg_state[key] = stacked.mean(dim=0).to(dtype=swa_checkpoints[0][key].dtype)
+    # v6: Apply SWA — average collected checkpoints (running sum / count)
+    if swa_state is not None and swa_count > 1:
+        log0(f"swa:applying averaged {swa_count} checkpoints")
+        current_state = base_model.state_dict()
+        avg_state = {
+            k: (v / swa_count).to(dtype=current_state[k].dtype)
+            for k, v in swa_state.items()
+        }
         base_model.load_state_dict(avg_state, strict=True)
-        del swa_checkpoints  # free memory
+        del swa_state
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1384,11 +1415,30 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
+    # v8: Magnitude pruning — zero out smallest N% of weights before quantization
+    if PRUNE_PERCENT > 0:
+        with torch.no_grad():
+            for name, param in base_model.named_parameters():
+                if param.ndim == 2 and param.numel() > 65536:
+                    threshold = torch.quantile(param.abs().float().flatten(), PRUNE_PERCENT / 100.0)
+                    mask = param.abs() < threshold
+                    param.masked_fill_(mask, 0.0)
+        log0(f"pruning:zeroed smallest {PRUNE_PERCENT}% of large matrix weights")
+
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    # v8: Use zstd-22 for better compression (saves ~1-2MB vs zlib)
+    if USE_ZSTD:
+        try:
+            import zstandard as zstd
+            quant_blob = zstd.ZstdCompressor(level=ZSTD_LEVEL).compress(quant_raw)
+        except ImportError:
+            log0("WARNING: zstandard not installed, falling back to zlib")
+            quant_blob = zlib.compress(quant_raw, level=9)
+    else:
+        quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1407,7 +1457,13 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    # Decompress (try zstd first, fall back to zlib)
+    try:
+        import zstandard as zstd
+        decompressed = zstd.ZstdDecompressor().decompress(quant_blob_disk)
+    except Exception:
+        decompressed = zlib.decompress(quant_blob_disk)
+    quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
