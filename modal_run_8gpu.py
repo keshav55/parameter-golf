@@ -46,8 +46,8 @@ def train_8gpu(run_id: str = "atris_v8_8gpu", wallclock: int = 600):
         "TRAIN_LOG_EVERY": "50",
         "NCCL_IB_DISABLE": "1",
         "WARMUP_STEPS": "5",
-        "EVAL_STRIDE": "0",        # standard eval (sliding window has a bug, gives worse score)
-        "EVAL_SEQ_LEN": "2048",    # match training seq len for consistency
+        "EVAL_STRIDE": "64",       # sliding window (fixed: uses compiled model now)
+        "EVAL_SEQ_LEN": "2048",   # match training seq len
     })
 
     cmd = ["torchrun", "--standalone", "--nproc_per_node=8", "train_gpt.py"]
