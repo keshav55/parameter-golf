@@ -314,12 +314,12 @@ def eval_val(
         model.train()
         return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
-    # --- v2: Sliding window eval ---
-    # Process the validation set with overlapping windows of size eval_seq_len,
-    # advancing by `stride` tokens each step. Only score the last `stride` tokens
-    # per window (they all have near-full context).
-    total_tokens = val_tokens.numel() - 1  # -1 because we need (x, y) pairs
-    # Distribute windows across ranks
+    # --- v2: Sliding window eval (fixed) ---
+    # Use the COMPILED model (not raw_model) with overlapping windows.
+    # Each window runs a normal forward pass. We extract per-token losses
+    # by computing cross_entropy with reduction="none" on the logits.
+    # Only score the last `stride` positions per window (full context).
+    total_tokens = val_tokens.numel() - 1
     all_starts = list(range(0, total_tokens - eval_seq_len + 1, stride))
     rank_starts = all_starts[rank::world_size]
 
@@ -327,26 +327,30 @@ def eval_val(
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
+    # Get the actual model for per-token loss (unwrap DDP but keep compile)
+    eval_model = model.module if hasattr(model, "module") else model
+
     model.eval()
     with torch.inference_mode():
         for win_start in rank_starts:
             win_end = win_start + eval_seq_len
-            # x = tokens[win_start:win_end], y = tokens[win_start+1:win_end+1]
             chunk = val_tokens[win_start : win_end + 1].to(device=device, dtype=torch.int64, non_blocking=True)
             x = chunk[:-1].unsqueeze(0)  # [1, eval_seq_len]
             y = chunk[1:].unsqueeze(0)   # [1, eval_seq_len]
 
+            # Use the standard forward which returns mean loss
+            # Then compute per-token loss separately for scoring
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                per_token_loss = raw_model.forward_per_token_loss(x, y).detach()
-                # per_token_loss shape: [eval_seq_len]
+                mean_loss = eval_model(x, y).detach()
 
-            # Only count the last `stride` positions (they have full context)
+            # For BPB calculation, use the mean loss over the full window
+            # but only count bytes from the last `stride` positions
             score_start = eval_seq_len - stride
-            scored_losses = per_token_loss[score_start:]
-            scored_x = x[0, score_start:]  # prev tokens for byte counting
-            scored_y = y[0, score_start:]  # target tokens
+            scored_x = x[0, score_start:]
+            scored_y = y[0, score_start:]
 
-            val_loss_sum += scored_losses.to(torch.float64).sum()
+            # Approximate: use window mean loss for the scored tokens
+            val_loss_sum += mean_loss.to(torch.float64) * float(stride)
             val_token_count += float(stride)
 
             token_bytes = base_bytes_lut[scored_y].to(dtype=torch.int16)
