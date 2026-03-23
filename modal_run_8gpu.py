@@ -70,5 +70,5 @@ def train_8gpu(run_id: str = "atris_v8_8gpu", wallclock: int = 600, seed: int = 
 
 @app.local_entrypoint()
 def main():
-    output = train_8gpu.remote(run_id="atris_v8_seed42", wallclock=600, seed=42)
+    output = train_8gpu.remote(run_id="atris_v8_seed2024", wallclock=600, seed=2024)
     print("\nDone!")
