@@ -13,7 +13,7 @@ image = (
 vol = modal.Volume.from_name("parameter-golf-data", create_if_missing=True)
 
 @app.function(image=image, gpu="H100:8", timeout=7200, volumes={"/data": vol})
-def train_8gpu(run_id: str = "atris_v8_8gpu", wallclock: int = 600):
+def train_8gpu(run_id: str = "atris_v8_8gpu", wallclock: int = 600, seed: int = 1337):
     import subprocess, shutil, sys
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -46,8 +46,9 @@ def train_8gpu(run_id: str = "atris_v8_8gpu", wallclock: int = 600):
         "TRAIN_LOG_EVERY": "50",
         "NCCL_IB_DISABLE": "1",
         "WARMUP_STEPS": "5",
-        "EVAL_STRIDE": "0",        # standard eval (sliding window approximation doesn't improve score)
-        "EVAL_SEQ_LEN": "2048",   # match training seq len
+        "EVAL_STRIDE": "0",
+        "EVAL_SEQ_LEN": "2048",
+        "SEED": str(seed),
     })
 
     cmd = ["torchrun", "--standalone", "--nproc_per_node=8", "train_gpt.py"]
@@ -69,5 +70,5 @@ def train_8gpu(run_id: str = "atris_v8_8gpu", wallclock: int = 600):
 
 @app.local_entrypoint()
 def main():
-    output = train_8gpu.remote(run_id="atris_v8_submission", wallclock=600)
+    output = train_8gpu.remote(run_id="atris_v8_seed42", wallclock=600, seed=42)
     print("\nDone!")
